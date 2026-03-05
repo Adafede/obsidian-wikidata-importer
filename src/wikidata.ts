@@ -22,16 +22,26 @@ export interface SearchOptions {
 	language: string;
 }
 
-// Wikidata SPARQL endpoint (main graph — excludes scholarly articles post-split)
+// ---------------------------------------------------------------------------
+// Endpoints
+// ---------------------------------------------------------------------------
+
+/** Wikidata Blazegraph endpoint. Post graph-split it no longer serves scholarly
+ *  articles (instance of Q13442814 and related types). */
 const WIKIDATA_SPARQL = "https://query.wikidata.org/sparql";
 
-// QLever endpoint for Wikidata — full graph including scholarly articles
-// See: https://qlever.cs.uni-freiburg.de/wikidata
+/** QLever Wikidata mirror — full graph, including the scholarly-article split.
+ *  Does NOT support the wikibase:label SERVICE; uses rdfs:label instead.
+ *  Does NOT accept &format=json; format is negotiated via Accept header only. */
 const QLEVER_SPARQL = "https://qlever.cs.uni-freiburg.de/api/wikidata";
 
-// Standard Wikidata prefixes that query.wikidata.org injects automatically
-// but QLever requires explicitly.
-const WIKIDATA_PREFIXES = `
+// ---------------------------------------------------------------------------
+// Prefixes
+// ---------------------------------------------------------------------------
+
+/** Standard Wikidata SPARQL prefixes. Blazegraph injects these automatically;
+ *  QLever requires them to be declared explicitly. */
+const WIKIDATA_PREFIXES = `\
 PREFIX wd: <http://www.wikidata.org/entity/>
 PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 PREFIX wikibase: <http://wikiba.se/ontology#>
@@ -52,16 +62,40 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX bd: <http://www.bigdata.com/rdf#>
 `;
 
-// Scholarly article instance-of QIDs that live in the split-off graph
-const SCHOLARLY_QIDS = new Set([
-	"Q13442814", // scholarly article
-	"Q191067",   // article
-	"Q17928402", // scientific article
-	"Q18918145", // academic journal article
-	"Q23927052", // conference paper
-	"Q87715823", // preprint
-	"Q580922",   // review article
-]);
+// ---------------------------------------------------------------------------
+// Language helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the user-supplied language setting (e.g. "mul,en", "de", "zh,en") into
+ * an ordered list of real BCP-47 language tags, dropping the Wikidata-internal
+ * pseudo-code "mul" which is not valid inside SPARQL FILTER(LANG(…)) or the
+ * wikibase:label SERVICE.
+ *
+ * "en" is appended as a final fallback if not already present, so labels are
+ * never silently dropped when the preferred language is unavailable.
+ */
+function parseLangs(language: string): string[] {
+	const langs = language
+		.split(",")
+		.map((l) => l.trim().toLowerCase())
+		.filter((l) => l.length > 0 && l !== "mul");
+
+	if (!langs.includes("en")) langs.push("en");
+	return langs;
+}
+
+/**
+ * Build a SPARQL FILTER expression that accepts any of the given language tags.
+ *   FILTER(LANG(?x) = "de" || LANG(?x) = "en")
+ */
+function langFilter(variable: string, langs: string[]): string {
+	return langs.map((l) => `LANG(${variable}) = "${l}"`).join(" || ");
+}
+
+// ---------------------------------------------------------------------------
+// Type helpers
+// ---------------------------------------------------------------------------
 
 function isString(type: string | null): boolean {
 	if (!type) return false;
@@ -86,50 +120,43 @@ function isDate(type: string | null): boolean {
 	return type === "http://www.w3.org/2001/XMLSchema#dateTime";
 }
 
+// ---------------------------------------------------------------------------
+// SPARQL runner
+// ---------------------------------------------------------------------------
+
 /**
- * Run a SPARQL SELECT query against the given endpoint and return raw bindings.
+ * Execute a SPARQL SELECT query and return the raw result bindings.
+ *
+ * @param endpoint  Full base URL of the SPARQL endpoint.
+ * @param query     Complete SPARQL query string (including PREFIX declarations
+ *                  when targeting QLever).
+ * @param qlever    When true, omits the Blazegraph-specific `&format=json`
+ *                  query parameter; format is negotiated via Accept header only.
  */
 async function runSparql(
 	endpoint: string,
 	query: string,
+	qlever = false,
 ): Promise<any[]> {
-	const url = `${endpoint}?query=${encodeURIComponent(query)}&format=json`;
+	const url = qlever
+		? `${endpoint}?query=${encodeURIComponent(query)}`
+		: `${endpoint}?query=${encodeURIComponent(query)}&format=json`;
+
 	try {
 		const response = await requestUrl({
 			url,
-			headers: {
-				// QLever requires an explicit Accept header for JSON
-				Accept: "application/sparql-results+json",
-			},
+			headers: { Accept: "application/sparql-results+json" },
 		});
 		return response.json?.results?.bindings ?? [];
 	} catch (e) {
-		console.warn(`SPARQL query failed for endpoint ${endpoint}:`, e);
+		console.warn(`[wikidata-importer] SPARQL query failed (${endpoint}):`, e);
 		return [];
 	}
 }
 
-/**
- * Check whether a Wikidata entity is a scholarly article by querying
- * QLever for its instance-of values.
- */
-async function isScholarlyEntity(id: string): Promise<boolean> {
-	const query = WIKIDATA_PREFIXES + `
-		SELECT ?type WHERE {
-			wd:${id} wdt:P31 ?type .
-		}
-		LIMIT 20
-	`;
-	const bindings = await runSparql(QLEVER_SPARQL, query);
-	for (const b of bindings) {
-		const typeUrl: string = b.type?.value ?? "";
-		const qid = typeUrl.match(/Q\d+$/)?.[0];
-		if (qid && SCHOLARLY_QIDS.has(`Q${qid.replace(/^Q/, "")}`)) {
-			return true;
-		}
-	}
-	return false;
-}
+// ---------------------------------------------------------------------------
+// Entity
+// ---------------------------------------------------------------------------
 
 export class Entity {
 	id: string;
@@ -161,15 +188,23 @@ export class Entity {
 
 	static async search(query: string, opts: SearchOptions): Promise<Entity[]> {
 		if (!query || query.length === 0) return [];
-		// support multiple comma-separated languages like "mul,en"
+
+		// Support comma-separated language list, including "mul" which the
+		// Wikidata action API does accept (unlike SPARQL FILTER).
 		const languages = opts.language
 			.split(",")
 			.map((l) => l.trim().toLowerCase())
 			.filter(Boolean);
+
 		const allResults = new Map<string, Entity>();
+
 		for (const lang of languages) {
-			const url = `https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=${lang}&uselang=${lang}&type=item&limit=10&search=${encodeURIComponent(query)}`;
-			console.log("Wikidata search:", url);
+			const url =
+				`https://www.wikidata.org/w/api.php` +
+				`?action=wbsearchentities&format=json` +
+				`&language=${lang}&uselang=${lang}` +
+				`&type=item&limit=10` +
+				`&search=${encodeURIComponent(query)}`;
 			try {
 				const response = await requestUrl(url);
 				const json: SearchResponse = response.json;
@@ -180,11 +215,12 @@ export class Entity {
 				}
 			} catch (e) {
 				console.warn(
-					`Wikidata search failed for language "${lang}":`,
+					`[wikidata-importer] Search failed for language "${lang}":`,
 					e,
 				);
 			}
 		}
+
 		return Array.from(allResults.values());
 	}
 
@@ -192,7 +228,7 @@ export class Entity {
 		str: string,
 		searchString: string,
 		replaceString: string,
-	) {
+	): string {
 		let result = str;
 		for (let i = 0; i < searchString.length; i++) {
 			const searchChar = searchString[i];
@@ -217,32 +253,56 @@ export class Entity {
 			.replace(/\$\{id\}/g, id);
 	}
 
+	// -------------------------------------------------------------------------
+	// Query builders
+	// -------------------------------------------------------------------------
+
 	/**
-	 * Build the SPARQL query body used by both endpoints.
-	 * `serviceBlock` is injected differently per endpoint since QLever
-	 * does not support the wikibase:label SERVICE — labels must be
-	 * fetched via rdfs:label directly.
+	 * Build the shared body of the properties SPARQL query.
+	 *
+	 * Two label strategies are supported:
+	 *
+	 * - Blazegraph (`useRdfsLabel = false`): uses the wikibase:label SERVICE
+	 *   which resolves labels server-side and handles language fallback
+	 *   automatically.
+	 *
+	 * - QLever (`useRdfsLabel = true`): the wikibase:label SERVICE is not
+	 *   supported, so labels are fetched via rdfs:label with an explicit
+	 *   FILTER over the user's preferred languages plus "en" as a fallback.
+	 *   "mul" is excluded because it is not a valid BCP-47 tag in FILTER(LANG()).
 	 */
 	private buildPropertiesQuery(
 		opts: GetPropertiesOptions,
 		useRdfsLabel: boolean,
 	): string {
+		const langs = parseLangs(opts.language);
+		// For the description OPTIONAL we use the first real language only
+		// (FILTER supports only one tag here in both endpoints).
+		const primaryLang = langs[0];
+
 		const labelFragment = useRdfsLabel
 			? `
-				OPTIONAL { ?property rdfs:label ?propertyLabel . FILTER(LANG(?propertyLabel) = "${opts.language}") }
-				OPTIONAL { ?value rdfs:label ?valueLabel . FILTER(LANG(?valueLabel) = "${opts.language}") }
-			`
+				OPTIONAL {
+					?property rdfs:label ?propertyLabel .
+					FILTER(${langFilter("?propertyLabel", langs)})
+				}
+				OPTIONAL {
+					?value rdfs:label ?valueLabel .
+					FILTER(${langFilter("?valueLabel", langs)})
+				}`
 			: `
 				SERVICE wikibase:label {
-					bd:serviceParam wikibase:language "[AUTO_LANGUAGE],${opts.language}" .
-				}
-			`;
+					bd:serviceParam wikibase:language "${langs.join(",")}" .
+				}`;
 
 		let query = `
 			SELECT ?propertyLabel ?value ?valueLabel ?valueType ?normalizedValue ?description WHERE {
 				wd:${this.id} ?propUrl ?value .
 				?property wikibase:directClaim ?propUrl .
-				OPTIONAL { wd:${this.id} schema:description ?description . FILTER (LANG(?description) = "${opts.language}") }
+				OPTIONAL {
+					wd:${this.id} schema:description ?description .
+					FILTER(LANG(?description) = "${primaryLang}")
+				}
 				OPTIONAL {
 					?statement psn:P31 ?normalizedValue .
 					?normalizedValue wikibase:quantityUnit ?unit .
@@ -258,15 +318,19 @@ export class Entity {
 			`;
 		}
 
-		query += labelFragment + `}`;
-
+		query += labelFragment + "\n\t\t}";
 		return query;
 	}
 
+	// -------------------------------------------------------------------------
+	// Binding parser
+	// -------------------------------------------------------------------------
+
 	/**
-	 * Parse raw SPARQL bindings into a Properties map, merging into `ret`.
-	 * Existing keys are extended rather than overwritten so results from
-	 * multiple endpoints can be combined cleanly.
+	 * Translate raw SPARQL result bindings into the Properties map, merging
+	 * into `ret`. Values that already exist (from a previous endpoint) are
+	 * deduplicated by string representation so that running both Blazegraph and
+	 * QLever never produces duplicate frontmatter entries.
 	 */
 	private parseBindings(
 		results: any[],
@@ -280,26 +344,21 @@ export class Entity {
 			const value: string = r.value?.value;
 			if (!value) continue;
 
-			const normalizedValue: string | null = r.normalizedValue
-				? r.normalizedValue.value
-				: null;
-			const type: string | null = r.valueType ? r.valueType.value : null;
-			const valueLabel: string | null = r.valueLabel
-				? r.valueLabel.value
-				: null;
+			const normalizedValue: string | null =
+				r.normalizedValue?.value ?? null;
+			const type: string | null = r.valueType?.value ?? null;
+			const valueLabel: string | null = r.valueLabel?.value ?? null;
 
 			if (
 				opts.ignoreCategories &&
-				valueLabel &&
-				valueLabel.startsWith("Category:")
+				valueLabel?.startsWith("Category:")
 			) {
 				continue;
 			}
 
 			if (
 				opts.ignoreWikipediaPages &&
-				valueLabel &&
-				valueLabel.startsWith("Wikipedia:")
+				valueLabel?.startsWith("Wikipedia:")
 			) {
 				continue;
 			}
@@ -308,7 +367,7 @@ export class Entity {
 				continue;
 			}
 
-			if (opts.spaceReplacement && opts.spaceReplacement.length > 0) {
+			if (opts.spaceReplacement) {
 				key = key.replace(/[^\d\p{L}]+/gu, opts.spaceReplacement);
 			}
 
@@ -325,19 +384,18 @@ export class Entity {
 			} else if (isString(type)) {
 				toAdd = value;
 			} else if (value.match(/Q\d+$/) && valueLabel) {
-				const id = value.match(/\d+$/);
-				if (!id) continue;
+				const idMatch = value.match(/(\d+)$/);
+				if (!idMatch) continue;
 				const label = Entity.buildLink(
 					opts.internalLinkPrefix,
 					valueLabel,
-					id[0],
+					idMatch[1],
 				);
 				toAdd = `[[${label}]]`;
 			}
 
 			if (toAdd === null) continue;
 
-			// Deduplicate values per key across merged endpoint results
 			if (ret[key]) {
 				const strVal = String(toAdd);
 				if (!ret[key].some((v) => String(v) === strVal)) {
@@ -349,20 +407,36 @@ export class Entity {
 		}
 	}
 
+	// -------------------------------------------------------------------------
+	// Public API
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Fetch all properties for this entity by querying both endpoints and
+	 * merging the results.
+	 *
+	 * - Blazegraph (`query.wikidata.org`) is queried first; it is the
+	 *   authoritative source for non-scholarly entities.
+	 * - QLever is queried second and fills in statements that are missing from
+	 *   Blazegraph due to the scholarly-article graph split. Results are merged
+	 *   and deduplicated.
+	 */
 	async getProperties(opts: GetPropertiesOptions): Promise<Properties> {
 		const ret: Properties = {};
 
-		// --- 1. Query the standard Wikidata SPARQL endpoint ---
-		const wdQuery = this.buildPropertiesQuery(opts, false);
-		const wdResults = await runSparql(WIKIDATA_SPARQL, wdQuery);
-		this.parseBindings(wdResults, opts, ret);
+		const [wdResults, qlResults] = await Promise.all([
+			runSparql(
+				WIKIDATA_SPARQL,
+				this.buildPropertiesQuery(opts, false),
+			),
+			runSparql(
+				QLEVER_SPARQL,
+				WIKIDATA_PREFIXES + this.buildPropertiesQuery(opts, true),
+				true,
+			),
+		]);
 
-		// --- 2. Always also query QLever (which has the full graph
-		//        including scholarly articles) and merge any extra statements.
-		//        QLever does not support wikibase:label SERVICE, so we use
-		//        rdfs:label instead. ---
-		const qlQuery = WIKIDATA_PREFIXES + this.buildPropertiesQuery(opts, true);
-		const qlResults = await runSparql(QLEVER_SPARQL, qlQuery);
+		this.parseBindings(wdResults, opts, ret);
 		this.parseBindings(qlResults, opts, ret);
 
 		return ret;
