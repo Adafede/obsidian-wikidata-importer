@@ -79,12 +79,35 @@ PREFIX bd: <http://www.bigdata.com/rdf#>
  * "en" is appended as a final fallback when not already present, ensuring
  * labels are never silently dropped when the preferred language is unavailable.
  */
+/**
+ * Languages for use with the wikibase:label SERVICE and FILTER(LANG(...)).
+ * "mul" is stripped because it is not a valid BCP-47 tag and silently matches
+ * nothing in those contexts. "en" is added as a fallback.
+ */
 function parseLangs(language: string): string[] {
 	const langs = language
 		.split(",")
 		.map((l) => l.trim().toLowerCase())
 		.filter((l) => l.length > 0 && l !== "mul");
 
+	if (!langs.includes("en")) langs.push("en");
+	return langs;
+}
+
+/**
+ * Languages for use with QLever rdfs:label FILTER — identical to parseLangs
+ * but retains "mul". Wikidata stores many scholarly article titles and other
+ * language-neutral strings under the "mul" language tag in the raw RDF, so
+ * FILTER(LANG(?label) = "mul") is valid and necessary against QLever.
+ */
+function parseLangsForRdfs(language: string): string[] {
+	const langs = language
+		.split(",")
+		.map((l) => l.trim().toLowerCase())
+		.filter((l) => l.length > 0);
+
+	// Always include mul (language-neutral literals) and en as fallback
+	if (!langs.includes("mul")) langs.push("mul");
 	if (!langs.includes("en")) langs.push("en");
 	return langs;
 }
@@ -222,8 +245,11 @@ export class Entity {
 				const response = await requestUrl(url);
 				const json: SearchResponse = response.json;
 				for (const result of json.search) {
-					if (!allResults.has(result.id)) {
+					if (allResults.has(result.id)) continue;
+					try {
 						allResults.set(result.id, Entity.fromJson(result));
+					} catch (e) {
+						console.warn(`[wikidata-importer] Skipping invalid search result:`, result, e);
 					}
 				}
 			} catch (e) {
@@ -255,7 +281,8 @@ export class Entity {
 		return result;
 	}
 
-	static buildLink(link: string, label: string, id: string): string {
+	static buildLink(link: string, label: string | undefined, id: string): string {
+		label = label ?? "";
 		const sanitisedLabel = Entity.replaceCharacters(
 			label,
 			'*/:#?<>[]"',
@@ -291,15 +318,16 @@ export class Entity {
 		const langs = parseLangs(opts.language);
 		const primaryLang = langs[0];
 
+		const rdfsLangs = parseLangsForRdfs(opts.language);
 		const labelFragment = useRdfsLabel
 			? `
 				OPTIONAL {
 					?property rdfs:label ?propertyLabel .
-					FILTER(${langFilter("?propertyLabel", langs)})
+					FILTER(${langFilter("?propertyLabel", rdfsLangs)})
 				}
 				OPTIONAL {
 					?value rdfs:label ?valueLabel .
-					FILTER(${langFilter("?valueLabel", langs)})
+					FILTER(${langFilter("?valueLabel", rdfsLangs)})
 				}`
 			: `
 				SERVICE wikibase:label {
